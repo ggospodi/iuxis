@@ -1,0 +1,198 @@
+"""
+Priority Engine — AI-powered task ranking.
+Uses local Ollama to rank tasks based on deadlines, dependencies,
+project priority, and strategic importance.
+"""
+from datetime import date, datetime
+from iuxis.ollama_client import ollama_generate
+from iuxis.db import get_connection, fetch_all
+import json
+
+
+class PriorityEngine:
+    def __init__(self):
+        self.conn = get_connection()
+
+    def rank_tasks_for_today(self) -> list[dict]:
+        """
+        AI-rank all active tasks and return ordered list.
+        Considers: task priority, project priority, due dates,
+        estimated hours, current focus areas.
+        """
+        tasks = fetch_all(
+            """SELECT t.id, t.title, t.priority, t.status, t.due_date,
+                   t.estimated_hours, p.name as project_name,
+                   p.priority as project_priority,
+                   p.time_allocation_hrs_week, p.current_focus
+            FROM tasks t
+            LEFT JOIN projects p ON t.project_id = p.id
+            WHERE t.status IN ('todo', 'in_progress')
+            ORDER BY t.priority ASC"""
+        )
+
+        if not tasks:
+            return []
+
+        # For small task lists (<10), use rule-based ranking (no LLM needed)
+        if len(tasks) <= 10:
+            return self._rule_based_rank(tasks)
+
+        # For larger lists, use Ollama for intelligent ranking
+        return self._ai_rank(tasks)
+
+    def _rule_based_rank(self, tasks: list[dict]) -> list[dict]:
+        """Fast rule-based ranking for small task sets."""
+        scored = []
+        today = date.today()
+
+        for t in tasks:
+            tid = t.get("id")
+            title = t.get("title", "Unknown")
+            pri = t.get("priority", 5)
+            status = t.get("status", "todo")
+            due = t.get("due_date")
+            hours = t.get("estimated_hours")
+            proj = t.get("project_name") or "General"
+            proj_pri = t.get("project_priority", 5)
+
+            score = 0
+
+            # Task priority (P1=40, P2=30, P3=20, P4=10, P5=5)
+            score += max(50 - (pri * 10), 5)
+
+            # Project priority boost
+            score += max(30 - (proj_pri * 5), 5)
+
+            # Due date urgency
+            if due:
+                try:
+                    due_date = datetime.strptime(due, '%Y-%m-%d').date()
+                    days_until = (due_date - today).days
+                    if days_until < 0:
+                        score += 50  # Overdue
+                    elif days_until == 0:
+                        score += 40  # Due today
+                    elif days_until <= 3:
+                        score += 30  # Due soon
+                    elif days_until <= 7:
+                        score += 15  # Due this week
+                except ValueError:
+                    pass
+
+            # In-progress bonus
+            if status == 'in_progress':
+                score += 15
+
+            scored.append({
+                'id': tid,
+                'title': title,
+                'project': proj,
+                'priority': pri,
+                'due_date': due,
+                'estimated_hours': hours,
+                'score': score,
+                'status': status
+            })
+
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        return scored
+
+    def _ai_rank(self, tasks: list[dict]) -> list[dict]:
+        """Use Ollama to rank tasks with strategic reasoning."""
+        task_text = "\n".join([
+            f"- ID:{t.get('id')} | {t.get('title', 'Unknown')} | P{t.get('priority', 5)} | {t.get('status', 'todo')} | Project: {t.get('project_name') or 'General'} (P{t.get('project_priority', 5)}) | Due: {t.get('due_date') or 'none'} | Est: {t.get('estimated_hours') or '?'}h"
+            for t in tasks
+        ])
+
+        prompt = f"""You are an AI Chief of Staff. Rank these tasks for today in order of what the operator should work on first.
+
+Consider: urgency (due dates), strategic importance (project priority), momentum (in-progress items), and time allocation (don't overweight any single project).
+
+Today is {date.today().strftime('%A, %B %d, %Y')}.
+
+TASKS:
+{task_text}
+
+Return ONLY a JSON array of task IDs in priority order, most important first:
+[task_id_1, task_id_2, ...]"""
+
+        response = ollama_generate(prompt, format_json=True, timeout=180)
+
+        if not response:
+            # Fallback to rule-based on failure
+            return self._rule_based_rank(tasks)
+
+        try:
+            # Parse JSON response
+            response_clean = response.strip()
+            if response_clean.startswith('```'):
+                # Strip markdown fences
+                response_clean = response_clean.split('\n', 1)[1].rsplit('\n', 1)[0]
+
+            parsed = json.loads(response_clean)
+
+            # Handle different response formats from Ollama
+            ranked_ids = []
+            if isinstance(parsed, list):
+                # Format 1: Simple array [19, 20, 28, ...]
+                ranked_ids = parsed
+            elif isinstance(parsed, dict):
+                # Try various dict formats
+                if 'tasks' in parsed:
+                    # Format 2: {"tasks": [{"id": 19, ...}, {"id": 20, ...}]}
+                    ranked_ids = [task.get('id') for task in parsed['tasks'] if 'id' in task]
+                elif 'ranked_ids' in parsed:
+                    # Format 3: {"ranked_ids": [19, 20, 28, ...]}
+                    ranked_ids = parsed['ranked_ids']
+                elif 'response' in parsed and isinstance(parsed['response'], list):
+                    # Format 4: {"response": [19, 20, 28, ...]}
+                    ranked_ids = parsed['response']
+                else:
+                    # Unknown format - fallback to rule-based
+                    print(f"⚠️  Unexpected AI response format, using rule-based ranking")
+                    return self._rule_based_rank(tasks)
+            else:
+                print(f"⚠️  AI response not list or dict, using rule-based ranking")
+                return self._rule_based_rank(tasks)
+
+            # Map back to task dicts
+            task_map = {t.get("id"): t for t in tasks}
+            result = []
+            for tid in ranked_ids:
+                if tid in task_map:
+                    t = task_map[tid]
+                    result.append({
+                        'id': t.get('id'),
+                        'title': t.get('title', 'Unknown'),
+                        'project': t.get('project_name') or 'General',
+                        'priority': t.get('priority', 5),
+                        'due_date': t.get('due_date'),
+                        'estimated_hours': t.get('estimated_hours'),
+                        'status': t.get('status', 'todo')
+                    })
+            return result
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"⚠️  AI ranking failed ({e}), falling back to rule-based")
+            # Fallback to rule-based
+            return self._rule_based_rank(tasks)
+
+
+# Legacy functions for backward compatibility
+def run_prioritization() -> str:
+    """Ask Claude to prioritize current tasks. Returns the analysis text."""
+    from iuxis.claude_client import prioritize_tasks
+    response, tokens = prioritize_tasks()
+    return response
+
+
+def generate_daily_schedule() -> str:
+    """Ask Claude to generate a time-blocked schedule for today."""
+    from iuxis.claude_client import chat
+    prompt = (
+        "Generate a concrete time-blocked schedule for today. "
+        "Use the project priorities and task list from the context. "
+        "Format each block as: TIME — PROJECT — TASK/ACTIVITY. "
+        "Include breaks. Start and end times should match work hours from config."
+    )
+    response, tokens = chat(prompt)
+    return response

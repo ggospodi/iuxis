@@ -1,0 +1,196 @@
+"""
+Enhanced Insight Engine — generates cross-project observations.
+Runs on demand or via scheduled job.
+"""
+from datetime import datetime
+from typing import Optional
+import json
+
+from iuxis.db import execute, fetch_all, get_connection
+from iuxis.ollama_client import ollama_generate
+from iuxis.models import Insight, InsightSeverity
+
+
+class InsightEngine:
+    def __init__(self):
+        self.conn = get_connection()
+
+    def generate_insights(self) -> list[dict]:
+        """
+        Analyze all projects and generate cross-project insights.
+        Categories:
+        - dependency: shared dependencies between projects
+        - stale: projects with no recent activity
+        - overload: time allocation exceeds available hours
+        - opportunity: synergies or efficiency gains
+        """
+        context = self._build_analysis_context()
+
+        prompt = f"""You are an AI Chief of Staff analyzing a solo operator's project portfolio.
+
+{context}
+
+Generate 2-4 actionable insights. Focus on:
+1. Cross-project dependencies or shared blockers
+2. Projects that are stalled or haven't been touched recently
+3. Time allocation issues (over/under allocated)
+4. Strategic opportunities (synergies, batching similar work)
+
+Return ONLY a JSON array:
+[
+  {{"type": "dependency|stale|overload|opportunity", "content": "...", "severity": "info|warning|critical", "projects": ["project1", "project2"]}}
+]"""
+
+        response = ollama_generate(prompt, format_json=True, timeout=240)
+
+        if not response:
+            return []
+
+        try:
+            # Parse JSON response
+            response_clean = response.strip()
+            if response_clean.startswith('```'):
+                # Strip markdown fences
+                response_clean = response_clean.split('\n', 1)[1].rsplit('\n', 1)[0]
+
+            insights = json.loads(response_clean)
+            saved = []
+            for insight in insights:
+                execute(
+                    """INSERT INTO insights (type, content, severity, status, created_at)
+                    VALUES (?, ?, ?, 'new', ?)""",
+                    (
+                        insight.get('type', 'observation'),
+                        insight['content'],
+                        insight.get('severity', 'info'),
+                        datetime.now().isoformat()
+                    )
+                )
+                saved.append(insight)
+            return saved
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"⚠️  Insight generation JSON parse failed: {e}")
+            return []
+
+    def _build_analysis_context(self) -> str:
+        """Build context for cross-project analysis."""
+        # Projects + allocations
+        projects = fetch_all(
+            """SELECT name, type, priority, status, current_focus,
+                   time_allocation_hrs_week, updated_at
+            FROM projects WHERE parent_id IS NULL
+            ORDER BY priority ASC"""
+        )
+
+        total_hours = sum(p.get("time_allocation_hrs_week", 0) for p in projects)
+
+        lines = [f"[PORTFOLIO: {len(projects)} projects, {total_hours}h/week total]"]
+        for p in projects:
+            name = p.get("name", "Unknown")
+            ptype = p.get("type", "unknown")
+            pri = p.get("priority", 5)
+            status = p.get("status", "unknown")
+            focus = p.get("current_focus") or "not set"
+            hours = p.get("time_allocation_hrs_week", 0)
+            updated = p.get("updated_at") or "unknown"
+            lines.append(
+                f"- P{pri}: {name} ({ptype}, {status}) — {hours}h/wk — "
+                f"Focus: {focus} — Last updated: {updated}"
+            )
+
+        # Task completion stats
+        task_stats = fetch_all(
+            """SELECT p.name,
+                   COUNT(CASE WHEN t.status = 'done' THEN 1 END) as done,
+                   COUNT(CASE WHEN t.status IN ('todo','in_progress') THEN 1 END) as active
+            FROM tasks t
+            LEFT JOIN projects p ON t.project_id = p.id
+            GROUP BY p.name"""
+        )
+
+        if task_stats:
+            lines.append("\n[TASK COMPLETION]")
+            for row in task_stats:
+                name = row.get("name") or "General"
+                done = row.get("done", 0)
+                active = row.get("active", 0)
+                lines.append(f"- {name}: {done} done, {active} active")
+
+        # Knowledge density
+        knowledge_stats = fetch_all(
+            """SELECT p.name, COUNT(uk.id) as entries
+            FROM user_knowledge uk
+            LEFT JOIN projects p ON uk.project_id = p.id
+            GROUP BY p.name ORDER BY entries DESC"""
+        )
+
+        if knowledge_stats:
+            lines.append("\n[KNOWLEDGE DENSITY]")
+            for row in knowledge_stats:
+                name = row.get("name") or "General"
+                count = row.get("entries", 0)
+                lines.append(f"- {name}: {count} entries")
+
+        return "\n".join(lines)
+
+
+# ============================================================================
+# Legacy functions for backward compatibility
+# ============================================================================
+
+def generate_morning_briefing() -> str:
+    """Generate and store the morning briefing. Returns the briefing text."""
+    from iuxis.claude_client import generate_briefing
+    response, tokens = generate_briefing()
+
+    # Store as an insight
+    execute(
+        """INSERT INTO insights (type, content, severity, status)
+           VALUES ('recommendation', ?, 'info', 'new')""",
+        (f"[MORNING BRIEFING]\n{response}",),
+    )
+
+    return response
+
+
+def run_pattern_analysis() -> str:
+    """Run overnight pattern analysis. Returns the analysis text."""
+    from iuxis.claude_client import analyze_patterns
+    response, tokens = analyze_patterns()
+
+    # Store as coaching insight
+    execute(
+        """INSERT INTO insights (type, content, severity, status)
+           VALUES ('pattern', ?, 'info', 'new')""",
+        (f"[PATTERN ANALYSIS]\n{response}",),
+    )
+
+    return response
+
+
+def get_recent_insights(limit: int = 10, status: Optional[str] = None) -> list[Insight]:
+    """Get recent insights, optionally filtered by status."""
+    query = "SELECT * FROM insights"
+    params: list = []
+
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+
+    rows = fetch_all(query, tuple(params))
+    return [Insight.from_row(r) for r in rows]
+
+
+def dismiss_insight(insight_id: int) -> None:
+    execute("UPDATE insights SET status = 'dismissed' WHERE id = ?", (insight_id,))
+
+
+def mark_insight_seen(insight_id: int) -> None:
+    execute("UPDATE insights SET status = 'seen' WHERE id = ?", (insight_id,))
+
+
+def mark_insight_acted(insight_id: int) -> None:
+    execute("UPDATE insights SET status = 'acted_on' WHERE id = ?", (insight_id,))

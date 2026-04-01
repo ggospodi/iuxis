@@ -1,0 +1,872 @@
+"""Ingestion engine — core pipeline for processing project files.
+
+Three-layer architecture:
+  Layer 1: Raw files in projects/<slug>/raw/ (immutable)
+  Layer 2: Knowledge entries in user_knowledge table (searchable)
+  Layer 3: Checkpoint summary in projects/<slug>/checkpoint.md (rolling)
+
+Pipeline: scan → read → extract via local Ollama → upsert DB → rotate checkpoint
+"""
+
+import json
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from iuxis.db import get_connection, fetch_one, fetch_all, execute
+from iuxis.knowledge_manager import add_knowledge_batch, get_project_knowledge, get_knowledge_stats
+from iuxis.file_processors import read_file, scan_directory, get_file_hash, estimate_tokens
+
+# Local LLM via Ollama
+from iuxis.ollama_client import ollama_extract_json, ollama_generate, test_connection as ollama_test
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PROJECTS_DIR = os.path.expanduser("~/Desktop/iuxis/projects")
+CHECKPOINTS_DIR = os.path.expanduser("~/Desktop/iuxis/checkpoints")
+MAX_TOKENS_PER_CALL = 30000  # Max input tokens per Claude extraction call
+
+
+# ---------------------------------------------------------------------------
+# Manifest Management (.ingested file)
+# ---------------------------------------------------------------------------
+
+def load_manifest(project_dir: str) -> dict:
+    """Load the .ingested manifest for a project."""
+    manifest_path = os.path.join(project_dir, ".ingested")
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r") as f:
+            return json.load(f)
+    return {"project_slug": "", "project_db_id": None, "files": [], "last_checkpoint_update": None}
+
+
+def save_manifest(project_dir: str, manifest: dict):
+    """Save the .ingested manifest."""
+    manifest_path = os.path.join(project_dir, ".ingested")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, default=str)
+
+
+def get_ingested_hashes(manifest: dict) -> dict[str, str]:
+    """Get a mapping of filename → sha256 from the manifest."""
+    return {f["filename"]: f["sha256"] for f in manifest.get("files", [])}
+
+
+# ---------------------------------------------------------------------------
+# Project Resolution
+# ---------------------------------------------------------------------------
+
+def resolve_project(slug: str) -> Optional[dict]:
+    """Find the DB project matching a folder slug.
+    
+    Tries exact match first, then fuzzy match (slug with hyphens → spaces).
+    """
+    conn = get_connection()
+
+    # Exact match on slug-style name
+    row = conn.execute(
+        "SELECT id, name, priority, current_focus, description FROM projects WHERE LOWER(REPLACE(name, ' ', '-')) = ?",
+        (slug.lower(),)
+    ).fetchone()
+
+    if row:
+        return {"id": row[0], "name": row[1], "priority": row[2], "focus": row[3], "description": row[4]}
+
+    # Fuzzy: try replacing hyphens with spaces
+    name_guess = slug.replace("-", " ").title()
+    row = conn.execute(
+        "SELECT id, name, priority, current_focus, description FROM projects WHERE LOWER(name) = LOWER(?)",
+        (name_guess,)
+    ).fetchone()
+
+    if row:
+        return {"id": row[0], "name": row[1], "priority": row[2], "focus": row[3], "description": row[4]}
+
+    # Try LIKE match
+    row = conn.execute(
+        "SELECT id, name, priority, current_focus, description FROM projects WHERE LOWER(name) LIKE ?",
+        (f"%{slug.replace('-', '%')}%",)
+    ).fetchone()
+
+    if row:
+        return {"id": row[0], "name": row[1], "priority": row[2], "focus": row[3], "description": row[4]}
+
+    return None
+
+
+def get_project_context(project_id: int) -> dict:
+    """Get current project state for the extraction prompt."""
+    conn = get_connection()
+
+    # Sub-projects
+    subs = conn.execute(
+        "SELECT id, name, status FROM projects WHERE parent_id = ?", (project_id,)
+    ).fetchall()
+
+    # Tasks (recent, active)
+    tasks = conn.execute(
+        """SELECT id, title, status, priority FROM tasks 
+           WHERE project_id = ? AND status NOT IN ('done', 'cancelled')
+           ORDER BY priority ASC LIMIT 15""",
+        (project_id,)
+    ).fetchall()
+
+    # Knowledge count
+    k_count = conn.execute(
+        "SELECT COUNT(*) FROM user_knowledge WHERE project_id = ? AND status = 'approved'",
+        (project_id,)
+    ).fetchone()[0]
+
+    return {
+        "sub_projects": [{"id": s[0], "name": s[1], "status": s[2]} for s in subs],
+        "tasks": [{"id": t[0], "title": t[1], "status": t[2], "priority": t[3]} for t in tasks],
+        "knowledge_count": k_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scanning for New Files
+# ---------------------------------------------------------------------------
+
+def scan_for_new_files(project_dir: str, manifest: dict, force: bool = False) -> list[str]:
+    """Find files in raw/ that haven't been ingested yet (or have changed).
+    
+    Args:
+        project_dir: Path to the project folder
+        manifest: Current .ingested manifest
+        force: If True, return all files regardless of manifest
+    
+    Returns:
+        List of file paths that need processing
+    """
+    raw_dir = os.path.join(project_dir, "raw")
+    if not os.path.exists(raw_dir):
+        return []
+
+    all_files = scan_directory(raw_dir)
+
+    if force:
+        return all_files
+
+    ingested = get_ingested_hashes(manifest)
+    new_files = []
+
+    for filepath in all_files:
+        filename = os.path.basename(filepath)
+        current_hash = get_file_hash(filepath)
+
+        if filename not in ingested or ingested[filename] != current_hash:
+            new_files.append(filepath)
+
+    return new_files
+
+
+# ---------------------------------------------------------------------------
+# Claude API Extraction
+# ---------------------------------------------------------------------------
+
+EXTRACTION_PROMPT = """You are the ingestion engine for Iuxis, an AI Chief of Staff application.
+Given raw project documents, extract structured data updates. Be thorough but precise.
+
+IMPORTANT RULES:
+- Extract FACTS, not opinions or speculation
+- Each knowledge entry should be one atomic, self-contained piece of information
+- Tasks should be specific and actionable
+- Confidence should be "high" for explicit statements, "medium" for reasonable inferences
+- Categories: fact, decision, context, relationship, compliance, risk, metric, contact, timeline, project_context, pattern
+
+Return ONLY valid JSON with no markdown fences, no preamble, no explanation."""
+
+
+def build_extraction_message(
+    project: dict,
+    context: dict,
+    file_contents: list[dict],
+    checkpoint_excerpt: str = "",
+) -> str:
+    """Build the user message for the extraction API call."""
+    # Sub-projects list
+    subs_str = ", ".join(
+        f"{s['name']} ({s['status']})" for s in context["sub_projects"]
+    ) or "None"
+
+    # Tasks list
+    tasks_str = "\n".join(
+        f"  - [{t['status']}] P{t['priority']}: {t['title']}" for t in context["tasks"]
+    ) or "  None"
+
+    # Sort files by filename (newest first) - assumes date-prefixed filenames
+    # e.g., "2026-03-03-update.md" comes before "2026-03-02-notes.md"
+    sorted_files = sorted(file_contents, key=lambda f: f["filename"], reverse=True)
+
+    # Separate newest file from historical files
+    newest_file = sorted_files[0] if sorted_files else None
+    historical_files = sorted_files[1:] if len(sorted_files) > 1 else []
+
+    # Format newest file
+    newest_str = ""
+    if newest_file:
+        newest_str = f"""
+========================================
+🎯 CURRENT STATE — AUTHORITATIVE SOURCE
+========================================
+This file represents the CURRENT state of the project.
+Use this file EXCLUSIVELY for determining:
+- project_updates.current_focus (MUST come from this file)
+- Current project status
+- Active priorities and recent decisions
+
+FILE: {newest_file['filename']} ({newest_file['file_type']}, ~{newest_file['token_estimate']} tokens)
+---
+{newest_file['content']}
+========================================
+"""
+
+    # Format historical files
+    historical_str = ""
+    if historical_files:
+        historical_str = "\n========================================\n📚 HISTORICAL CONTEXT\n========================================\nThese are older files for background context.\nExtract knowledge entries, but DO NOT use these for current_focus or project status.\n"
+        for fc in historical_files:
+            historical_str += f"\n--- FILE: {fc['filename']} ({fc['file_type']}, ~{fc['token_estimate']} tokens) ---\n"
+            historical_str += fc["content"]
+            historical_str += "\n--- END FILE ---\n"
+        historical_str += "========================================\n"
+
+    msg = f"""PROJECT CONTEXT:
+- Project: {project['name']} (id={project['id']}, P{project['priority']})
+- Focus: {project.get('focus', 'Not set')}
+- Sub-projects: {subs_str}
+- Active tasks:
+{tasks_str}
+- Knowledge entries in DB: {context['knowledge_count']}
+"""
+
+    if checkpoint_excerpt:
+        msg += f"\nLast checkpoint excerpt (first 500 words):\n{checkpoint_excerpt[:2000]}\n"
+
+    msg += f"""
+NEW DOCUMENTS ({len(file_contents)} files) to process:
+{newest_str}
+{historical_str}
+
+CRITICAL EXTRACTION RULES:
+1. The NEWEST file (marked "CURRENT STATE") is the ONLY authoritative source for current_focus
+2. Extract knowledge from ALL files, but prioritize facts from the newest file
+3. Older files provide historical context — extract knowledge but do NOT blend them into current_focus
+4. The project_updates.current_focus field MUST reflect ONLY what the newest file states
+
+EXTRACT AND RETURN AS JSON:
+{{
+  "knowledge_entries": [
+    {{
+      "category": "fact|decision|context|relationship|compliance|risk|metric|contact|timeline|project_context|pattern",
+      "content": "One specific, self-contained piece of information",
+      "confidence": "high|medium|low",
+      "tags": ["tag1", "tag2"]
+    }}
+  ],
+  "task_actions": [
+    {{
+      "action": "create|update",
+      "title": "Task title (for create) or existing task title (for update)",
+      "priority": 2,
+      "estimated_hours": 3,
+      "tags": ["tag1"],
+      "updates": {{"status": "done"}}
+    }}
+  ],
+  "project_updates": {{
+    "current_focus": "Updated focus from NEWEST file only (or null if no change)",
+    "description_addendum": "Additional description text (or null)"
+  }},
+  "cross_project_insights": [
+    {{
+      "content": "Observation connecting this project to others",
+      "severity": "info|warning|action_required"
+    }}
+  ],
+  "checkpoint_summary": "2-3 sentence summary of key additions from this ingestion batch."
+}}"""
+
+    return msg
+
+
+def call_extraction_api(system_prompt: str, user_message: str, client=None) -> Optional[dict]:
+    """Call local Ollama for structured extraction."""
+    print(f"  🏠 Using local model via Ollama...")
+    
+    result = ollama_extract_json(
+        messages=[{"role": "user", "content": user_message}],
+        system=system_prompt,
+        timeout=600,  # Local models need more time
+    )
+    
+    if result is None:
+        print(f"  ❌ Local extraction failed")
+    
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Database Upsert
+# ---------------------------------------------------------------------------
+
+def apply_extraction_results(project: dict, results: dict, source_files: list[str]) -> dict:
+    """Apply extracted results to the database.
+    
+    Returns a summary of what was done.
+    """
+    conn = get_connection()
+    summary = {
+        "knowledge_added": 0,
+        "tasks_created": 0,
+        "tasks_updated": 0,
+        "insights_added": 0,
+        "project_updated": False,
+    }
+
+    source_file_str = ", ".join(os.path.basename(f) for f in source_files)
+
+    # 1. Knowledge entries
+    knowledge_entries = results.get("knowledge_entries", [])
+    if knowledge_entries:
+        for entry in knowledge_entries:
+            entry["project_id"] = project["id"]
+            entry["source_file"] = source_file_str
+            entry["source"] = "ingestion"
+        summary["knowledge_added"] = add_knowledge_batch(knowledge_entries, project_id=project["id"])
+
+    # 2. Task actions
+    for task in results.get("task_actions", []):
+        if task.get("action") == "create":
+            # Check for duplicate by title
+            existing = conn.execute(
+                "SELECT id FROM tasks WHERE project_id = ? AND LOWER(title) = LOWER(?)",
+                (project["id"], task["title"])
+            ).fetchone()
+
+            if not existing:
+                conn.execute(
+                    """INSERT INTO tasks (project_id, title, priority, estimated_hours, 
+                       created_by, tags, status)
+                       VALUES (?, ?, ?, ?, 'ai', ?, 'todo')""",
+                    (
+                        project["id"],
+                        task["title"],
+                        task.get("priority", 3),
+                        task.get("estimated_hours"),
+                        json.dumps(task.get("tags", [])),
+                    ),
+                )
+                summary["tasks_created"] += 1
+
+        elif task.get("action") == "update":
+            updates = task.get("updates", {})
+            if updates and task.get("title"):
+                existing = conn.execute(
+                    "SELECT id FROM tasks WHERE project_id = ? AND LOWER(title) LIKE LOWER(?)",
+                    (project["id"], f"%{task['title']}%")
+                ).fetchone()
+
+                if existing:
+                    set_parts = []
+                    values = []
+                    for k, v in updates.items():
+                        if k in ("status", "priority", "estimated_hours", "description"):
+                            set_parts.append(f"{k} = ?")
+                            values.append(v)
+                    if set_parts:
+                        values.append(existing[0])
+                        conn.execute(
+                            f"UPDATE tasks SET {', '.join(set_parts)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            tuple(values),
+                        )
+                        summary["tasks_updated"] += 1
+
+    # 3. Project updates
+    proj_updates = results.get("project_updates", {})
+    if proj_updates:
+        new_focus = proj_updates.get("current_focus")
+        if new_focus:
+            conn.execute(
+                "UPDATE projects SET current_focus = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_focus, project["id"])
+            )
+            summary["project_updated"] = True
+
+    # 4. Cross-project insights
+    for insight in results.get("cross_project_insights", []):
+        conn.execute(
+            "INSERT INTO insights (type, content, severity) VALUES (?, ?, ?)",
+            ("recommendation", insight["content"], insight.get("severity", "info")),
+        )
+        summary["insights_added"] += 1
+
+    # 5. Activity log
+    conn.execute(
+        """INSERT INTO activity_log (event_type, details, project_id)
+           VALUES ('insight_generated', ?, ?)""",
+        (
+            json.dumps({
+                "action": "file_ingestion",
+                "files": [os.path.basename(f) for f in source_files],
+                "knowledge_added": summary["knowledge_added"],
+                "tasks_created": summary["tasks_created"],
+            }),
+            project["id"],
+        ),
+    )
+
+    conn.commit()
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint Rotation
+# ---------------------------------------------------------------------------
+
+def rotate_checkpoint(project_dir: str, project: dict, new_summary: str, client=None):
+    """Rotate checkpoint: compress current → archive, generate new.
+    
+    1. Read current checkpoint.md
+    2. Compress it via Claude API
+    3. Prepend compressed version to checkpoint-archive.md
+    4. Generate new checkpoint.md from archive + knowledge + DB state
+    """
+    checkpoint_path = os.path.join(project_dir, "checkpoint.md")
+    archive_path = os.path.join(project_dir, "checkpoint-archive.md")
+
+    # Read current checkpoint
+    current_checkpoint = ""
+    if os.path.exists(checkpoint_path):
+        with open(checkpoint_path, "r") as f:
+            current_checkpoint = f.read()
+
+    if not current_checkpoint.strip():
+        # No existing checkpoint — just write the new summary
+        with open(checkpoint_path, "w") as f:
+            f.write(f"# {project['name']} — Checkpoint\n\n")
+            f.write(f"**Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+            f.write(new_summary)
+        return
+
+    # Compress current checkpoint
+    compressed = compress_checkpoint(current_checkpoint, client)
+
+    # Prepend to archive
+    archive_entry = (
+        f"\n\n---\n\n"
+        f"### Archived: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"{compressed}\n"
+    )
+
+    existing_archive = ""
+    if os.path.exists(archive_path):
+        with open(archive_path, "r") as f:
+            existing_archive = f.read()
+
+    with open(archive_path, "w") as f:
+        f.write(f"# {project['name']} — Checkpoint Archive\n\n")
+        f.write(archive_entry)
+        if existing_archive:
+            # Strip the header from existing archive before appending
+            existing_archive = re.sub(r"^#.*?—.*?Archive\s*\n+", "", existing_archive)
+            f.write(existing_archive)
+
+    # Generate new checkpoint
+    new_checkpoint = generate_new_checkpoint(project, compressed, new_summary, client)
+
+    with open(checkpoint_path, "w") as f:
+        f.write(new_checkpoint)
+
+
+def compress_checkpoint(checkpoint_text: str, client=None) -> str:
+    """Compress a checkpoint to ~500 words using local Ollama."""
+    prompt = (
+        "Compress this project checkpoint to its essential facts in under 500 words. "
+        "Preserve: key metrics, current status, active decisions, blockers, deadlines. "
+        "Drop: completed tasks, resolved issues, historical detail that's no longer relevant.\n\n"
+        f"{checkpoint_text}"
+    )
+    
+    result = ollama_generate(prompt, timeout=300)
+    
+    if result:
+        # Strip any <think>...</think> blocks from DeepSeek R1
+        import re as _re
+        result = _re.sub(r"<think>.*?</think>", "", result, flags=_re.DOTALL).strip()
+        return result
+    
+    # Fallback: just take first 500 words
+    words = checkpoint_text.split()[:500]
+    return " ".join(words) + "\n\n[Compression failed — Ollama unavailable]"
+
+
+def generate_new_checkpoint(
+    project: dict,
+    compressed_history: str,
+    new_additions: str,
+    client=None,
+) -> str:
+    """Generate a fresh checkpoint.md from history + new data + DB state."""
+    conn = get_connection()
+
+    # Get current DB state
+    row = conn.execute(
+        "SELECT name, type, status, priority, current_focus, time_allocation_hrs_week, description FROM projects WHERE id = ?",
+        (project["id"],)
+    ).fetchone()
+
+    subs = conn.execute(
+        "SELECT name, status, priority FROM projects WHERE parent_id = ?",
+        (project["id"],)
+    ).fetchall()
+
+    active_tasks = conn.execute(
+        """SELECT title, status, priority FROM tasks 
+           WHERE project_id = ? AND status NOT IN ('done', 'cancelled')
+           ORDER BY priority ASC""",
+        (project["id"],)
+    ).fetchall()
+
+    # Build checkpoint
+    name = row[0] if row else project["name"]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    lines = [
+        f"# {name} — Checkpoint",
+        f"",
+        f"**Last Updated:** {now}  ",
+        f"**Status:** {row[2] if row else 'active'} | **Priority:** P{row[3] if row else '?'} | "
+        f"**Time:** {row[5] if row else '?'} hrs/week",
+        f"",
+        f"## Current Focus",
+        f"",
+        f"{row[4] if row and row[4] else 'Not set'}",
+        f"",
+    ]
+
+    if row and row[6]:
+        lines += [f"## Description", f"", f"{row[6]}", f""]
+
+    if subs:
+        lines += [f"## Sub-Projects", f""]
+        for s in subs:
+            lines.append(f"- **{s[0]}** ({s[1]}, P{s[2]})")
+        lines.append("")
+
+    if active_tasks:
+        lines += [f"## Active Tasks", f""]
+        for t in active_tasks:
+            lines.append(f"- [{t[1]}] P{t[2]}: {t[0]}")
+        lines.append("")
+
+    if compressed_history:
+        lines += [f"## Context (From History)", f"", compressed_history, f""]
+
+    if new_additions:
+        lines += [f"## Latest Update", f"", new_additions, f""]
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main Ingestion Pipeline
+# ---------------------------------------------------------------------------
+
+def ingest_project(slug: str, force: bool = False, dry_run: bool = False) -> dict:
+    """Run the full ingestion pipeline for a project.
+    
+    Args:
+        slug: Project folder name (e.g., "tengrium", "health-data-vault")
+        force: If True, re-process all files
+        dry_run: If True, show what would happen without writing
+    
+    Returns:
+        Summary dict of actions taken.
+    """
+    project_dir = os.path.join(PROJECTS_DIR, slug)
+
+    if not os.path.exists(project_dir):
+        print(f"  ❌ Project directory not found: {project_dir}")
+        return {"error": f"Directory not found: {project_dir}"}
+
+    # Resolve project in DB
+    project = resolve_project(slug)
+    if not project:
+        print(f"  ❌ No matching project in database for slug '{slug}'")
+        print(f"     Run: python ingest.py --init \"{slug}\" to create one")
+        return {"error": f"No DB match for '{slug}'"}
+
+    print(f"  📁 Project: {project['name']} (id={project['id']})")
+
+    # Load manifest
+    manifest = load_manifest(project_dir)
+    manifest["project_slug"] = slug
+    manifest["project_db_id"] = project["id"]
+
+    # Scan for new files
+    new_files = scan_for_new_files(project_dir, manifest, force=force)
+
+    if not new_files:
+        print(f"  ✅ No new files to process.")
+        return {"project": project["name"], "files_processed": 0}
+
+    print(f"  📄 Found {len(new_files)} new file(s):")
+    for f in new_files:
+        print(f"     - {os.path.basename(f)}")
+
+    if dry_run:
+        print(f"  🔍 Dry run — no changes made.")
+        return {"project": project["name"], "files_found": len(new_files), "dry_run": True}
+
+    # Read file contents
+    client = None
+    if False:  # Using local Ollama
+        client = None  # Ollama used instead
+
+    file_contents = []
+    total_tokens = 0
+    for filepath in new_files:
+        print(f"  📖 Reading: {os.path.basename(filepath)}...")
+        result = read_file(filepath, client=client)
+        file_contents.append(result)
+        total_tokens += result["token_estimate"]
+
+    print(f"  📊 Total content: ~{total_tokens} tokens")
+
+    # TODO: batch if > MAX_TOKENS_PER_CALL (for now, send all at once)
+
+    # Get project context
+    context = get_project_context(project["id"])
+
+    # Read current checkpoint excerpt
+    checkpoint_path = os.path.join(project_dir, "checkpoint.md")
+    checkpoint_excerpt = ""
+    if os.path.exists(checkpoint_path):
+        with open(checkpoint_path, "r") as f:
+            words = f.read().split()[:500]
+            checkpoint_excerpt = " ".join(words)
+
+    # Build extraction prompt and call API
+    print(f"  🧠 Calling local Ollama for extraction...")
+    user_message = build_extraction_message(project, context, file_contents, checkpoint_excerpt)
+    extraction_results = call_extraction_api(EXTRACTION_PROMPT, user_message, client=client)
+
+    if not extraction_results:
+        print(f"  ❌ Extraction failed. Files not marked as ingested.")
+        return {"project": project["name"], "error": "extraction_failed"}
+
+    # Apply results to DB
+    print(f"  💾 Applying to database...")
+    summary = apply_extraction_results(project, extraction_results, new_files)
+
+    print(f"     Knowledge entries: +{summary['knowledge_added']}")
+    print(f"     Tasks created: +{summary['tasks_created']}")
+    print(f"     Tasks updated: {summary['tasks_updated']}")
+    print(f"     Insights added: +{summary['insights_added']}")
+    if summary["project_updated"]:
+        print(f"     Project focus updated ✓")
+
+    # Rotate checkpoint
+    new_summary = extraction_results.get("checkpoint_summary", "")
+    print(f"  📝 Rotating checkpoint...")
+    rotate_checkpoint(project_dir, project, new_summary, client=client)
+
+    # Update manifest
+    for filepath in new_files:
+        manifest["files"].append({
+            "filename": os.path.basename(filepath),
+            "sha256": get_file_hash(filepath),
+            "ingested_at": datetime.now().isoformat(),
+            "size_bytes": os.path.getsize(filepath),
+            "token_count": estimate_tokens(open(filepath, "r", errors="replace").read()) 
+                           if not filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')) 
+                           else 0,
+        })
+    manifest["last_checkpoint_update"] = datetime.now().isoformat()
+    save_manifest(project_dir, manifest)
+
+    summary["project"] = project["name"]
+    summary["files_processed"] = len(new_files)
+    return summary
+
+
+def ingest_all(force: bool = False, dry_run: bool = False) -> list[dict]:
+    """Run ingestion for all project directories."""
+    if not os.path.exists(PROJECTS_DIR):
+        print(f"❌ Projects directory not found: {PROJECTS_DIR}")
+        return []
+
+    results = []
+    for entry in sorted(os.listdir(PROJECTS_DIR)):
+        project_dir = os.path.join(PROJECTS_DIR, entry)
+        if os.path.isdir(project_dir) and not entry.startswith("."):
+            raw_dir = os.path.join(project_dir, "raw")
+            if os.path.exists(raw_dir):
+                print(f"\n🔄 Processing: {entry}")
+                result = ingest_project(entry, force=force, dry_run=dry_run)
+                results.append(result)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Project Initialization
+# ---------------------------------------------------------------------------
+
+def init_project(name: str, create_db_entry: bool = True) -> str:
+    """Initialize a new project folder structure.
+    
+    Args:
+        name: Human-readable project name
+        create_db_entry: If True, also create a project in the DB
+    
+    Returns:
+        The project slug.
+    """
+    slug = name.lower().replace(" ", "-").replace("_", "-")
+    slug = re.sub(r"[^a-z0-9-]", "", slug)
+
+    project_dir = os.path.join(PROJECTS_DIR, slug)
+    raw_dir = os.path.join(project_dir, "raw")
+
+    os.makedirs(raw_dir, exist_ok=True)
+
+    # Create initial manifest
+    manifest = {
+        "project_slug": slug,
+        "project_db_id": None,
+        "files": [],
+        "last_checkpoint_update": None,
+    }
+
+    if create_db_entry:
+        # Check if project exists
+        project = resolve_project(slug)
+        if project:
+            manifest["project_db_id"] = project["id"]
+            print(f"  ✅ Linked to existing DB project: {project['name']} (id={project['id']})")
+        else:
+            conn = get_connection()
+            cursor = conn.execute(
+                """INSERT INTO projects (name, type, status, priority, description)
+                   VALUES (?, 'product', 'active', 3, ?)""",
+                (name, f"Ingested via ingest.py --init"),
+            )
+            conn.commit()
+            manifest["project_db_id"] = cursor.lastrowid
+            print(f"  ✅ Created DB project: {name} (id={manifest['project_db_id']})")
+
+    save_manifest(project_dir, manifest)
+
+    # Create empty checkpoint
+    checkpoint_path = os.path.join(project_dir, "checkpoint.md")
+    if not os.path.exists(checkpoint_path):
+        with open(checkpoint_path, "w") as f:
+            f.write(f"# {name} — Checkpoint\n\n**Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n*No ingestion data yet.*\n")
+
+    return slug
+
+
+# ---------------------------------------------------------------------------
+# Migration from Existing Checkpoints
+# ---------------------------------------------------------------------------
+
+def migrate_existing_checkpoints():
+    """Migrate existing checkpoint files from checkpoints/ into projects/ structure."""
+    if not os.path.exists(CHECKPOINTS_DIR):
+        print(f"  ⚠️ No checkpoints directory found at {CHECKPOINTS_DIR}")
+        return
+
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+
+    checkpoint_files = [
+        f for f in os.listdir(CHECKPOINTS_DIR)
+        if f.endswith("-checkpoint.md")
+    ]
+
+    if not checkpoint_files:
+        print(f"  ⚠️ No checkpoint files found in {CHECKPOINTS_DIR}")
+        return
+
+    for filename in sorted(checkpoint_files):
+        # Derive slug from filename: "tengrium-checkpoint.md" → "tengrium"
+        slug = filename.replace("-checkpoint.md", "")
+        project_dir = os.path.join(PROJECTS_DIR, slug)
+        raw_dir = os.path.join(project_dir, "raw")
+
+        print(f"\n  📦 Migrating: {filename} → projects/{slug}/")
+
+        os.makedirs(raw_dir, exist_ok=True)
+
+        # Copy checkpoint
+        src = os.path.join(CHECKPOINTS_DIR, filename)
+        dst = os.path.join(project_dir, "checkpoint.md")
+
+        with open(src, "r") as f:
+            content = f.read()
+        with open(dst, "w") as f:
+            f.write(content)
+
+        # Resolve project and create manifest
+        project = resolve_project(slug)
+        manifest = {
+            "project_slug": slug,
+            "project_db_id": project["id"] if project else None,
+            "files": [],
+            "last_checkpoint_update": datetime.now().isoformat(),
+        }
+        save_manifest(project_dir, manifest)
+
+        if project:
+            print(f"     Linked to: {project['name']} (id={project['id']})")
+
+            # Extract user knowledge entries from checkpoint
+            knowledge_count = extract_knowledge_from_checkpoint(content, project["id"])
+            if knowledge_count:
+                print(f"     Extracted: {knowledge_count} knowledge entries")
+        else:
+            print(f"     ⚠️ No DB project found for slug '{slug}'")
+
+    print(f"\n  ✅ Migration complete. Original checkpoints preserved in {CHECKPOINTS_DIR}/")
+
+
+def extract_knowledge_from_checkpoint(checkpoint_text: str, project_id: int) -> int:
+    """Parse user knowledge entries from a checkpoint file and insert them.
+    
+    Looks for sections like:
+    ```
+    1. [decision] Some knowledge entry
+    2. [fact] Another entry
+    ```
+    """
+    # Pattern: numbered list with [category] prefix
+    pattern = r"\d+\.\s*\[(\w+)\]\s*(.+)"
+    matches = re.findall(pattern, checkpoint_text)
+
+    if not matches:
+        return 0
+
+    entries = []
+    for category, content in matches:
+        category = category.lower()
+        if category not in {"fact", "decision", "compliance", "project_context", "context", 
+                            "relationship", "risk", "metric", "contact", "timeline", "pattern",
+                            "preference", "workflow_rule"}:
+            category = "fact"  # Default
+
+        entries.append({
+            "category": category,
+            "content": content.strip(),
+            "source": "checkpoint_migration",
+            "confidence": "high",
+            "status": "approved",
+        })
+
+    return add_knowledge_batch(entries, project_id=project_id)

@@ -1,0 +1,40 @@
+# Iuxis Configuration
+# Copy to config.yaml and edit to match your system:
+#   cp config.example.yaml config.yaml
+
+# ── LLM Setup (Required) ─────────────────────────────────────────
+# Iuxis runs entirely on local LLMs via Ollama. No cloud API needed.
+llm:
+  primary_backend: "ollama"
+  primary_url: "http://localhost:11434/api/chat"
+  primary_model: "qwen2.5:14b"           # Recommended: qwen2.5:32b (64GB RAM) or qwen2.5:14b (32GB RAM)
+  fallback_url: "http://localhost:11434/api/chat"
+  fallback_model: "qwen2.5:14b"          # Used if primary fails
+  max_tokens: 4096
+  timeout: 300
+  use_thinking: false
+  context_window: 65536
+
+# ── User Preferences ─────────────────────────────────────────────
+user:
+  work_start: "08:00"
+  work_end: "18:00"
+  max_deep_work_blocks: 4
+  preferred_block_duration_minutes: 120
+  timezone: "America/New_York"            # Your timezone
+
+# ── Database ─────────────────────────────────────────────────────
+database:
+  path: "data/iuxis.db"
+
+# ── Scheduler (Premium) ──────────────────────────────────────────
+scheduler:
+  morning_briefing: "06:00"
+  evening_review: "20:00"
+  overnight_batch: "02:00"
+
+# ── Obsidian Integration (Optional) ──────────────────────────────
+# Uncomment and set paths if you use Obsidian for notes.
+# obsidian:
+#   vault_path: "~/path/to/your/vault"
+#   index_on_startup: true

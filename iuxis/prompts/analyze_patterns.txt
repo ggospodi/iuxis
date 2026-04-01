@@ -1,0 +1,9 @@
+Analyze the activity log and task completion data below. Look for:
+
+1. **Time patterns** — When is the user most productive? What time of day do tasks get completed?
+2. **Estimation accuracy** — Compare estimated vs actual hours. Is there a systematic bias?
+3. **Context-switching cost** — How many project switches per day? Does higher switching correlate with lower completion?
+4. **Neglected projects** — Which active projects have received zero attention recently?
+5. **Velocity trends** — Is task completion rate increasing or decreasing?
+
+Give 3-5 specific, actionable observations. Reference concrete numbers from the data. No vague generalities.

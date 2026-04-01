@@ -1,0 +1,9 @@
+The user is asking about content from their knowledge vault (Obsidian Second Brain). I've searched the vault and found the following relevant files and snippets.
+
+Analyze these results and:
+1. Rank them by relevance to the user's query
+2. For each relevant result, explain what it contains and why it matters
+3. If the user's query relates to a specific project, connect the vault content to that project's goals
+4. Suggest any follow-up actions (e.g., "review this paper", "extract data from this note")
+
+If the results don't adequately answer the query, say so and suggest alternative search terms.

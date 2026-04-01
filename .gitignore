@@ -1,0 +1,55 @@
+# Iuxis — .gitignore
+
+# User data (never commit)
+data/*.db
+data/*.db-journal
+projects/*/raw/*
+projects/*/checkpoint.md
+projects/*/checkpoint-archive.md
+!projects/example-project/raw/*
+
+# Config with personal paths
+config.yaml
+
+# License key
+~/.iuxis/
+
+# FAISS vectors
+.iuxis/
+
+# Inbox
+iuxis-inbox/
+
+# Session files (development history)
+iuxis-session-checkpoint-*.md
+next-session-prompt-*.md
+day*.md
+stream*.md
+*-spec-*.md
+*-plan-*.md
+*-guide-*.md
+
+# Node
+iuxis-web/node_modules/
+iuxis-web/.next/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+data/*.db-shm
+data/*.db-wal

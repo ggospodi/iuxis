@@ -1,0 +1,180 @@
+"""
+Morning Briefing Engine for Iuxis.
+Generates a daily priority briefing using local Ollama inference.
+"""
+import json
+from datetime import date, datetime
+from iuxis.ollama_client import ollama_generate
+from iuxis.db import get_connection, fetch_all, execute
+
+
+class BriefingEngine:
+    def __init__(self):
+        self.conn = get_connection()
+
+    def generate_morning_briefing(self) -> dict:
+        """
+        Generate a morning briefing containing:
+        - Top 3 priorities for today
+        - Deadline alerts (next 7 days)
+        - Blocked/stalled items
+        - Cross-project observations
+        - Suggested schedule
+
+        Returns: {
+            'briefing_text': str,   # Formatted briefing
+            'generated_at': str      # ISO timestamp
+        }
+        """
+        # Build rich context
+        context = self._build_briefing_context()
+
+        prompt = f"""You are an AI Chief of Staff for a solo operator managing multiple projects.
+Generate a concise morning briefing for {date.today().strftime('%A, %B %d, %Y')}.
+
+{context}
+
+FORMAT YOUR BRIEFING EXACTLY AS:
+
+## 🌅 Morning Briefing — {date.today().strftime('%A, %B %d')}
+
+### 🎯 Top 3 Priorities
+1. [Most important task/action] — [which project] — [why now]
+2. [Second priority] — [which project] — [why now]
+3. [Third priority] — [which project] — [why now]
+
+### ⚠️ Deadline Alerts
+- [Any tasks due within 7 days, or "No upcoming deadlines"]
+
+### 🚫 Blocked / Stalled
+- [Tasks or projects with no progress, or "Nothing blocked"]
+
+### 💡 Cross-Project Observations
+- [1-2 observations about dependencies, synergies, or patterns across projects]
+
+### 📅 Suggested Focus Blocks
+- 6:00–8:00 AM: [Deep work recommendation]
+- 8:00–10:00 AM: [Second block]
+- 10:00 AM–12:00 PM: [Third block]
+- 1:00–3:00 PM: [Afternoon block]
+- 3:00–4:00 PM: [Wind-down / admin]
+
+Keep it concise. No fluff. Actionable items only."""
+
+        response = ollama_generate(prompt, timeout=300)
+
+        if not response:
+            return {
+                'briefing_text': "⚠️ Failed to generate briefing. Check that Ollama is running.",
+                'generated_at': datetime.now().isoformat()
+            }
+
+        # Store as an insight
+        execute(
+            """INSERT INTO insights (type, content, severity, status, created_at)
+               VALUES ('recommendation', ?, 'info', 'new', ?)""",
+            (response, datetime.now().isoformat())
+        )
+
+        return {
+            'briefing_text': response,
+            'generated_at': datetime.now().isoformat()
+        }
+
+    def _build_briefing_context(self) -> str:
+        """Build comprehensive context for briefing generation."""
+        sections = []
+
+        # All projects with priorities and time allocations
+        projects = fetch_all(
+            """SELECT p.name, p.priority, p.status, p.current_focus,
+                   p.time_allocation_hrs_week, p.type
+            FROM projects p
+            WHERE p.parent_id IS NULL AND p.status = 'active'
+            ORDER BY p.priority ASC"""
+        )
+
+        if projects:
+            proj_lines = ["[ACTIVE PROJECTS]"]
+            for row in projects:
+                name = row.get("name", "Unknown")
+                pri = row.get("priority", 5)
+                ptype = row.get("type", "unknown")
+                hours = row.get("time_allocation_hrs_week", 0)
+                focus = row.get("current_focus") or "not set"
+                proj_lines.append(f"- P{pri}: {name} ({ptype}, {hours}h/wk) — Focus: {focus}")
+            sections.append("\n".join(proj_lines))
+
+        # All active tasks with due dates
+        tasks = fetch_all(
+            """SELECT t.title, t.priority, t.status, t.due_date,
+                   t.estimated_hours, p.name as project_name
+            FROM tasks t
+            LEFT JOIN projects p ON t.project_id = p.id
+            WHERE t.status IN ('todo', 'in_progress')
+            ORDER BY t.priority ASC, t.due_date ASC"""
+        )
+
+        if tasks:
+            task_lines = ["[ACTIVE TASKS]"]
+            for row in tasks:
+                title = row.get("title", "Unknown")
+                pri = row.get("priority", 5)
+                status = row.get("status", "todo")
+                due = row.get("due_date")
+                hours = row.get("estimated_hours")
+                proj = row.get("project_name") or "General"
+                due_str = f" (due: {due})" if due else ""
+                hrs_str = f" [{hours}h]" if hours else ""
+                task_lines.append(f"- P{pri} [{status}] {title} — {proj}{due_str}{hrs_str}")
+            sections.append("\n".join(task_lines))
+
+        # Recent knowledge entries (last 15)
+        knowledge = fetch_all(
+            """SELECT uk.content, uk.category, p.name
+            FROM user_knowledge uk
+            LEFT JOIN projects p ON uk.project_id = p.id
+            WHERE uk.status = 'approved'
+            ORDER BY uk.created_at DESC
+            LIMIT 15"""
+        )
+
+        if knowledge:
+            know_lines = ["[RECENT KNOWLEDGE]"]
+            for row in knowledge:
+                content = row.get("content", "")
+                cat = row.get("category", "unknown")
+                proj = row.get("name") or "General"
+                know_lines.append(f"- [{proj}/{cat}] {content}")
+            sections.append("\n".join(know_lines))
+
+        # Recent activity (last 48h)
+        activity = fetch_all(
+            """SELECT event_type, details, created_at
+            FROM activity_log
+            WHERE created_at > datetime('now', '-2 days')
+            ORDER BY created_at DESC
+            LIMIT 10"""
+        )
+
+        if activity:
+            act_lines = ["[RECENT ACTIVITY (48h)]"]
+            for row in activity:
+                etype = row.get("event_type", "unknown")
+                details = row.get("details", "")
+                details_short = details[:100] if details else "no details"
+                act_lines.append(f"- {etype}: {details_short}")
+            sections.append("\n".join(act_lines))
+
+        return "\n\n".join(sections)
+
+    def get_latest_briefing(self) -> str | None:
+        """Get the most recent briefing from today."""
+        row = fetch_all(
+            """SELECT content, created_at FROM insights
+            WHERE type = 'recommendation'
+            AND content LIKE '%Morning Briefing%'
+            AND date(created_at) = date('now')
+            ORDER BY created_at DESC LIMIT 1"""
+        )
+        return row[0].get("content") if row else None

@@ -1,0 +1,216 @@
+"""File processors — read content from different file types.
+
+Layer 1 readers: take raw files from the drop zone and extract text content
+for the ingestion engine to process.
+
+Supports: .md, .txt, .csv, .pdf, .png, .jpg, .jpeg, .webp
+"""
+
+import os
+import base64
+import hashlib
+from pathlib import Path
+from typing import Optional
+
+# PDF support — optional dependency
+try:
+    import fitz  # PyMuPDF
+    HAS_PYMUPDF = True
+except ImportError:
+    HAS_PYMUPDF = False
+
+
+# ---------------------------------------------------------------------------
+# File Metadata
+# ---------------------------------------------------------------------------
+
+def get_file_hash(filepath: str) -> str:
+    """Get SHA256 hash of a file."""
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def get_file_size(filepath: str) -> int:
+    """Get file size in bytes."""
+    return os.path.getsize(filepath)
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars per token for English text)."""
+    return len(text) // 4
+
+
+# ---------------------------------------------------------------------------
+# Text-Based Files
+# ---------------------------------------------------------------------------
+
+SUPPORTED_TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".tsv", ".json", ".yaml", ".yml"}
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+SUPPORTED_PDF_EXTENSIONS = {".pdf"}
+
+ALL_SUPPORTED_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | SUPPORTED_IMAGE_EXTENSIONS | SUPPORTED_PDF_EXTENSIONS
+
+
+def read_text_file(filepath: str) -> str:
+    """Read a text-based file and return its content."""
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+# ---------------------------------------------------------------------------
+# PDF Files
+# ---------------------------------------------------------------------------
+
+def read_pdf_file(filepath: str) -> str:
+    """Extract text from a PDF using PyMuPDF.
+    
+    Falls back to a placeholder message if PyMuPDF isn't installed.
+    """
+    if not HAS_PYMUPDF:
+        return (
+            f"[PDF file: {os.path.basename(filepath)} — "
+            f"Install PyMuPDF for text extraction: pip install PyMuPDF --break-system-packages]"
+        )
+
+    text_parts = []
+    try:
+        doc = fitz.open(filepath)
+        for page_num, page in enumerate(doc, 1):
+            page_text = page.get_text("text")
+            if page_text.strip():
+                text_parts.append(f"--- Page {page_num} ---\n{page_text.strip()}")
+        doc.close()
+    except Exception as e:
+        return f"[PDF extraction failed for {os.path.basename(filepath)}: {e}]"
+
+    if not text_parts:
+        return f"[PDF file: {os.path.basename(filepath)} — no extractable text (may be image-based)]"
+
+    return "\n\n".join(text_parts)
+
+
+# ---------------------------------------------------------------------------
+# Image Files (requires Claude API)
+# ---------------------------------------------------------------------------
+
+def encode_image_base64(filepath: str) -> str:
+    """Encode an image file as base64 string."""
+    with open(filepath, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def get_image_media_type(filepath: str) -> str:
+    """Get the media type for an image file."""
+    ext = Path(filepath).suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }
+    return media_types.get(ext, "image/png")
+
+
+def describe_image(filepath: str, client=None) -> str:
+    """Placeholder for image description — local vision model not yet configured.
+    
+    DeepSeek R1 32B does not support vision. Images are logged but not processed.
+    Future: add LLaVA or similar local vision model via Ollama.
+    
+    Args:
+        filepath: Path to the image file
+        client: Unused (kept for API compatibility)
+    
+    Returns:
+        Placeholder text noting the image was found but not processed.
+    """
+    filename = os.path.basename(filepath)
+    size = os.path.getsize(filepath)
+    return (
+        f"[Image: {filename} ({size:,} bytes) — "
+        f"Image content not extracted (local vision model not configured). "
+        f"File preserved in raw/ for future processing.]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unified File Reader
+# ---------------------------------------------------------------------------
+
+def read_file(filepath: str, client=None) -> dict:
+    """Read any supported file and return structured result.
+    
+    Args:
+        filepath: Path to the file
+        client: Optional anthropic client for image processing
+    
+    Returns:
+        {
+            "filename": "example.md",
+            "filepath": "/full/path/example.md",
+            "extension": ".md",
+            "content": "extracted text...",
+            "size_bytes": 1234,
+            "sha256": "abc123...",
+            "token_estimate": 300,
+            "file_type": "text" | "pdf" | "image",
+        }
+    """
+    filepath = str(filepath)
+    ext = Path(filepath).suffix.lower()
+    filename = os.path.basename(filepath)
+
+    if ext not in ALL_SUPPORTED_EXTENSIONS:
+        return {
+            "filename": filename,
+            "filepath": filepath,
+            "extension": ext,
+            "content": f"[Unsupported file type: {ext}]",
+            "size_bytes": get_file_size(filepath),
+            "sha256": get_file_hash(filepath),
+            "token_estimate": 0,
+            "file_type": "unsupported",
+        }
+
+    # Read content based on type
+    if ext in SUPPORTED_TEXT_EXTENSIONS:
+        content = read_text_file(filepath)
+        file_type = "text"
+    elif ext in SUPPORTED_PDF_EXTENSIONS:
+        content = read_pdf_file(filepath)
+        file_type = "pdf"
+    elif ext in SUPPORTED_IMAGE_EXTENSIONS:
+        content = describe_image(filepath, client=client)
+        file_type = "image"
+    else:
+        content = f"[Unknown file type: {ext}]"
+        file_type = "unknown"
+
+    return {
+        "filename": filename,
+        "filepath": filepath,
+        "extension": ext,
+        "content": content,
+        "size_bytes": get_file_size(filepath),
+        "sha256": get_file_hash(filepath),
+        "token_estimate": estimate_tokens(content),
+        "file_type": file_type,
+    }
+
+
+def scan_directory(directory: str) -> list[str]:
+    """List all supported files in a directory (non-recursive)."""
+    dirpath = Path(directory)
+    if not dirpath.exists():
+        return []
+
+    files = []
+    for f in sorted(dirpath.iterdir()):
+        if f.is_file() and f.suffix.lower() in ALL_SUPPORTED_EXTENSIONS:
+            files.append(str(f))
+
+    return files

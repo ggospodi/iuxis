@@ -1,0 +1,11 @@
+Analyze the current tasks and suggest a prioritized order. Consider:
+
+1. Hard deadlines (non-negotiable dates)
+2. Dependencies — does completing this unblock other work?
+3. Project priority — higher priority projects should get attention first
+4. Time sensitivity — is there a window that closes?
+5. Effort vs. impact — quick wins that unlock progress should rank higher
+
+For each task, give a 1-sentence rationale for its position.
+
+If you notice tasks that should exist but don't (based on project goals and current focus areas), suggest them with the prefix [SUGGESTED].

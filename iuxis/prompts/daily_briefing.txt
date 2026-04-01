@@ -1,0 +1,13 @@
+You are generating the morning briefing for today. Based on the project and task data below, produce a structured briefing with these sections:
+
+1. **Today's Priority Order** — Rank the top 5 tasks for today. For each, explain WHY it should be in that position (deadline proximity, blocking other work, strategic importance).
+
+2. **Upcoming Deadlines** — List anything due in the next 7 days.
+
+3. **Blocked Tasks** — List any tasks marked as blocked and suggest how to unblock them.
+
+4. **Cross-Project Observations** — Note any dependencies, overlaps, or synergies between projects. Be specific.
+
+5. **Suggested Schedule** — Propose time blocks for today's work. Use 2-hour deep work blocks. Account for breaks. Work hours are {work_start} to {work_end}.
+
+Be direct and actionable. No filler. If something is urgent, say so clearly.
