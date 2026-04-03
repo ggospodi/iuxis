@@ -1,8 +1,14 @@
 # 🧠 Iuxis — Your AI Chief of Staff
 
+[![Website](https://img.shields.io/badge/website-iuxis.ai-3B82F6)](https://iuxis.ai)
+[![License: MIT](https://img.shields.io/badge/license-MIT-10B981)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/ggospodi/iuxis?style=social)](https://github.com/ggospodi/iuxis)
+
 **Local-first AI assistant for solo operators managing multiple concurrent projects.**
 
 No cloud. No subscriptions for core features. Your data never leaves your machine.
+
+🌐 **[iuxis.ai](https://iuxis.ai)** — Learn more, see pricing, get started.
 
 ![Iuxis Dashboard](docs/dashboard-screenshot.png)
 
@@ -300,7 +306,12 @@ Iuxis is free and open-source for core features. Premium adds compounding intell
 - **Advanced cross-project analysis** — Deep dependency mapping and portfolio optimization
 - **Unlimited projects** — No soft cap, optimized context for 15+ projects
 
-**$29/month or $199/year** — [Get Premium at iuxis.ai](https://iuxis.ai)
+**$29/month or $199/year** — [Get Premium](https://iuxis.ai/#pricing)
+
+| Plan | Price | Link |
+|------|-------|------|
+| Monthly | $29/month | [Subscribe Monthly](https://iuxis.lemonsqueezy.com/checkout/buy/775c5dea-5783-48ed-b37b-ef6b6d83eb81?enabled=1481876) |
+| Annual | $199/year (save 43%) | [Subscribe Annual](https://iuxis.lemonsqueezy.com/checkout/buy/382dbc2d-eef6-42d7-b147-72f828351906?enabled=1481853) |
 
 Premium uses a local license key (`~/.iuxis/license.key`) — no cloud validation, no phone-home. Respects the local-first philosophy.
 
