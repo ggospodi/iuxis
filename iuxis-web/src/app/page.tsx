@@ -37,11 +37,7 @@ export default function Dashboard() {
       <StatsBar stats={data.stats} />
 
       {/* Today's Focus — full width (renamed briefing) */}
-      <BriefingCard
-        briefing={data.briefing}
-        title="Today's Focus"
-        projectCount={data.projects.projects?.length ?? 0}
-      />
+      <BriefingCard briefing={data.briefing} title="Today's Focus" projectCount={data.projects.projects?.length ?? 0} />
 
       {/* Project Cards — full width */}
       <ProjectGrid projects={data.projects.projects} />
