@@ -94,6 +94,16 @@ class IuxisScheduler:
             misfire_grace_time=3600
         )
 
+        # Daily database backup — 3:00 AM
+        self.scheduler.add_job(
+            self._run_daily_backup,
+            CronTrigger(hour=3, minute=0),
+            id='daily_backup',
+            name='Daily Database Backup',
+            replace_existing=True,
+            misfire_grace_time=3600  # 1 hour grace if laptop was asleep
+        )
+
     def start(self):
         """Start the scheduler."""
         if not self.scheduler.running:
@@ -213,6 +223,25 @@ class IuxisScheduler:
             logger.error(f"GitHub scan failed: {e}")
             print(f"[{datetime.now()}] GitHub scan failed: {e}")
 
+    def _run_daily_backup(self):
+        """Create a scheduled backup of the database (daily at 3 AM).
+
+        Uses SQLite's online backup API — atomic and safe even while the DB
+        is in active use. Backups land in ~/.iuxis/backups/ and are auto-pruned
+        per the retention policy in iuxis.backup (7 daily + 4 weekly).
+        """
+        try:
+            from iuxis import backup as backup_mod
+            path = backup_mod.create_backup(reason="scheduled")
+            size_mb = path.stat().st_size / (1024 * 1024)
+            logger.info(
+                f"Daily backup created: {path.name} ({size_mb:.2f} MB)"
+            )
+            print(f"[{datetime.now()}] Daily backup: {path.name} ({size_mb:.2f} MB)")
+        except Exception as e:
+            logger.error(f"Daily backup failed: {e}")
+            print(f"[{datetime.now()}] Daily backup failed: {e}")
+
     # Manual triggers (called from chat)
     def trigger_briefing(self):
         self._run_morning_briefing()
@@ -225,6 +254,9 @@ class IuxisScheduler:
 
     def trigger_consolidation(self):
         self._run_memory_consolidation()
+
+    def trigger_backup(self):
+        self._run_daily_backup()
 
 
 # ============================================================================

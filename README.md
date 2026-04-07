@@ -166,6 +166,9 @@ Connect your repos via a Personal Access Token. Iuxis pulls commit activity, ope
 ### Sub-Projects
 Nest projects under parent projects for complex workstreams. Each sub-project has its own tasks, knowledge, and focus.
 
+### Automatic Backups
+Three-layer protection for your data. Iuxis takes a safety snapshot before any project deletion (kept indefinitely), runs a full database backup every night at 3 AM with rolling retention, and lets you trigger manual backups any time. One-call restore brings back anything you didn't mean to delete. All backups are local — they live in `~/.iuxis/backups/` and never touch the cloud.
+
 ---
 
 ## LLM Setup
@@ -342,6 +345,52 @@ paths:
 ingestion:
   watch_interval: 30        # Seconds between inbox scans
 ```
+
+---
+
+## Backups & Recovery
+
+Iuxis takes data integrity seriously. Three layers of protection are built in and require no setup.
+
+**Pre-destructive snapshots.** Before any project deletion, Iuxis automatically creates a safety backup. If a delete was unintended, one API call restores the project, its tasks, knowledge entries, and sub-projects. Pre-delete backups are kept indefinitely.
+
+**Daily scheduled backups.** A full database snapshot is taken every night at 3:00 AM. The retention policy keeps the last 7 daily backups plus 4 weekly archives — about 11 snapshots, ~10 MB total for a typical install.
+
+**Manual snapshots.** Trigger a backup any time, useful before risky operations or major edits:
+
+```bash
+curl -X POST http://localhost:8000/api/backup/create \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "manual", "label": "before-major-edit"}'
+```
+
+### Where backups live
+
+All backups are stored in `~/.iuxis/backups/` outside the repo. Filenames follow the pattern:
+
+```
+iuxis-{reason}-{label}-{YYYYMMDD-HHMMSS}.db
+```
+
+### Listing backups
+
+```bash
+curl http://localhost:8000/api/backup/list
+```
+
+Optional `?reason=scheduled|manual|pre-delete|pre-commit` filter.
+
+### Restoring a backup
+
+```bash
+curl -X POST http://localhost:8000/api/backup/restore \
+  -H "Content-Type: application/json" \
+  -d '{"filename": "iuxis-pre-delete-MyProject-20260406-194413.db"}'
+```
+
+A pre-restore safety snapshot of the current database is created automatically before the restore happens, so a restore can itself be rewound.
+
+Backups use SQLite's online backup API — atomic, safe while the database is in active use, zero downtime.
 
 ---
 

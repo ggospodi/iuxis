@@ -2,7 +2,7 @@
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from iuxis_api.routes import projects, tasks, chat, knowledge, intelligence, ingestion, system, premium, connectors, work_pills, github, settings, onboarding
+from iuxis_api.routes import projects, tasks, chat, knowledge, intelligence, ingestion, system, premium, connectors, work_pills, github, settings, onboarding, backup
 
 logger = logging.getLogger("iuxis_api")
 
@@ -134,6 +134,7 @@ app.include_router(work_pills.router, prefix="/api", tags=["Work Pills"])
 app.include_router(github.router, prefix="/api/github", tags=["GitHub"])
 app.include_router(settings.router, prefix="/api", tags=["Settings"])
 app.include_router(onboarding.router)
+app.include_router(backup.router)
 
 # WebSocket routes
 from iuxis_api.websocket import chat_ws, dashboard_ws

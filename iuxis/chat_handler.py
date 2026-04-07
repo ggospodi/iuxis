@@ -201,8 +201,9 @@ action: update_project
 project_id: 123
 priority: 1-5 (optional)
 current_focus: Updated focus (optional)
-status: active|paused|blocked|monitoring (optional)
+status: active|paused|blocked|monitoring (optional — these are the ONLY valid values; "cancelled", "deleted", "archived", "removed" are NOT valid and will fail)
 ---END_COMMAND---
+# NOTE: update_project is for MODIFYING a project. To DELETE a project, use the delete_project command below — NEVER use update_project with a fake status like "cancelled".
 
 ---COMMAND---
 action: update_priority
@@ -216,6 +217,23 @@ action: delete_project
 project_name: (required) exact project name to delete
 confirm: (required) must be "yes" — always ask the user to confirm before deleting
 ---END_COMMAND---
+
+# ============================================================================
+# DELETION RULES — READ CAREFULLY
+# ============================================================================
+# When the user asks to delete, remove, get rid of, drop, kill, wipe, or
+# otherwise eliminate a project (examples: "delete X", "remove the X project",
+# "get rid of X", "drop X", "I don't need X anymore", "cancel the X project"),
+# you MUST use the delete_project command above.
+#
+# DO NOT use update_project with status="cancelled". DO NOT use status="deleted",
+# "archived", "removed", or any other made-up value. The projects.status field
+# only accepts: active, paused, blocked, monitoring. Any other value will fail
+# silently and the project will NOT be deleted, leaving the user confused.
+#
+# The ONLY way to delete a project is the delete_project command.
+# Always ask the user to confirm before issuing delete_project.
+# ============================================================================
 
 Multiple commands can be included in a single response. The system will execute them and confirm.
 
@@ -504,6 +522,7 @@ def _exec_delete_project(cmd: dict) -> str:
     """Delete a project and all its sub-projects, tasks, and knowledge entries."""
     import sqlite3
     from iuxis.db import get_connection
+    from iuxis import backup as backup_mod
 
     project_name = cmd.get("project_name", "")
     confirm = cmd.get("confirm", "").lower()
@@ -520,6 +539,22 @@ def _exec_delete_project(cmd: dict) -> str:
 
     project_id = project_rows[0]["id"]
     project_name_actual = project_rows[0]["name"]
+
+    # ----- SAFETY: pre-delete backup. If this fails, ABORT the delete. -----
+    try:
+        backup_path = backup_mod.create_backup(
+            reason="pre-delete", label=project_name_actual
+        )
+        logger.info(
+            f"[ChatHandler] Pre-delete backup created: {backup_path.name}"
+        )
+    except Exception as e:
+        logger.error(f"[ChatHandler] Pre-delete backup FAILED, aborting delete: {e}")
+        return (
+            f"❌ Delete aborted: could not create safety backup ({e}). "
+            f"No changes were made to '{project_name_actual}'."
+        )
+    # -----------------------------------------------------------------------
 
     # Get all sub-project IDs (recursive)
     all_ids = [project_id]
@@ -563,7 +598,11 @@ def _exec_delete_project(cmd: dict) -> str:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.close()
 
-        return f"✅ Project '{project_name_actual}' and all its sub-projects, tasks, and knowledge entries have been deleted.\n\n*Refresh your dashboard (Cmd+R) to see the changes.*"
+        return (
+            f"✅ Project '{project_name_actual}' and all its sub-projects, tasks, and knowledge entries have been deleted.\n\n"
+            f"💾 Safety backup saved as `{backup_path.name}` — restore via `POST /api/backup/restore` if this was a mistake.\n\n"
+            f"*Refresh your dashboard (Cmd+R) to see the changes.*"
+        )
 
     except Exception as e:
         logger.error(f"[ChatHandler] Failed to delete project {project_name}: {e}")
